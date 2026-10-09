@@ -221,6 +221,131 @@ def patch_aac_sbr_diagnostic():
         decoder_path.write_text(source.replace(old, new, 1))
 
 
+def patch_mp3_frame_diagnostic():
+    decoder_path = (
+        Path(env.subst("$PROJECT_DIR"))
+        / ".pio"
+        / "libdeps"
+        / env.subst("$PIOENV")
+        / "libhelix"
+        / "src"
+        / "MP3DecoderHelix.h"
+    )
+    if not decoder_path.exists():
+        raise RuntimeError(f"MP3 diagnostic target missing: {decoder_path}")
+
+    source = decoder_path.read_text()
+    marker = "MP3 first frame diagnostic:"
+    if marker in source:
+        return
+    old = """    if (info.outputSamps > 0) {
+      // provide result"""
+    new = """    if (info.outputSamps > 0) {
+      if (mp3FrameInfo.samprate == 0) {
+        Serial.printf(
+            "MP3 first frame diagnostic: rate=%d channels=%d bits=%d "
+            "output_samples=%d layer=%d version=%d bitrate=%d "
+            "info_callback=%d pcm_callback=%d\\n",
+            info.samprate, info.nChans, info.bitsPerSample, info.outputSamps,
+            info.layer, info.version, info.bitrate,
+            infoCallback != nullptr, pcmCallback != nullptr);
+      }
+      // provide result"""
+    if old not in source:
+        raise RuntimeError(f"MP3 diagnostic patch no longer matches: {decoder_path}")
+    decoder_path.write_text(source.replace(old, new, 1))
+
+
+def patch_helix_resync_diagnostic():
+    # Diagnostic for the MP3/AAC "too fast" investigation: every per-frame
+    # decode byte-accounting and bit-depth theory has been ruled out, yet
+    # total decoded audio consistently comes out to ~half the file's real
+    # duration while 100% of the file's compressed bytes get consumed by
+    # EOF. CommonHelix::writeChunk()'s loop only has one way to consume
+    # bytes *without* producing a frame of PCM: resynch()'s "invalid data"
+    # paths (rc==0 after repeated stalls, or rc<-1) call
+    # removeInvalidData(pos), which discards pos bytes as garbage and never
+    # calls provideResult()/writeToOut(). If roughly every other real frame
+    # is being misdetected as invalid here (e.g. a false/missed sync match)
+    # that would silently swallow ~half the audio while still advancing
+    # past its compressed bytes - exactly matching every measurement so
+    # far. This patch counts real decode successes (rc>0) vs. bytes
+    # discarded as invalid, and prints a running tally periodically so a
+    # hardware log can show directly whether this path is firing anywhere
+    # near as often as the ~2x ratio implies. Remove once root-caused.
+    project_dir = Path(env.subst("$PROJECT_DIR"))
+    common_path = (
+        project_dir
+        / ".pio"
+        / "libdeps"
+        / env.subst("$PIOENV")
+        / "libhelix"
+        / "src"
+        / "CommonHelix.h"
+    )
+    if not common_path.exists():
+        return
+
+    source = common_path.read_text()
+    old = """  virtual size_t writeChunk(const void *in_ptr, size_t in_size) {
+    LOGI_HELIX("writeChunk %zu", in_size);
+#ifdef ARDUINO
+    time_last_write = millis();
+#endif
+    size_t result = frame_buffer.writeArray((uint8_t *)in_ptr, in_size);
+
+    while (frame_buffer.available() >= minFrameBufferSize()) {
+      if (!presync()) break;
+      int rc = decode();
+      if (!resynch(rc)) break;
+
+      LOGI_HELIX("rc: %d - available %d", rc, frame_buffer.available());
+    }
+
+    return result;
+  }"""
+    new = """  virtual size_t writeChunk(const void *in_ptr, size_t in_size) {
+    LOGI_HELIX("writeChunk %zu", in_size);
+#ifdef ARDUINO
+    time_last_write = millis();
+#endif
+    size_t result = frame_buffer.writeArray((uint8_t *)in_ptr, in_size);
+
+    while (frame_buffer.available() >= minFrameBufferSize()) {
+      if (!presync()) break;
+      int rc = decode();
+      int available_before = frame_buffer.available();
+      if (rc > 0) {
+        helixDiagFrameOk_++;
+      } else {
+        helixDiagFrameBad_++;
+      }
+      if (!resynch(rc)) break;
+      int discarded = available_before - frame_buffer.available();
+      if (rc <= 0 && discarded > 0) {
+        helixDiagDiscardedBytes_ += discarded;
+      }
+      if ((helixDiagFrameOk_ + helixDiagFrameBad_) % 500 == 0) {
+        Serial.printf(
+            "Helix resync diagnostic: frames_ok=%lu frames_bad=%lu "
+            "discarded_bytes=%lu\\n",
+            (unsigned long)helixDiagFrameOk_, (unsigned long)helixDiagFrameBad_,
+            (unsigned long)helixDiagDiscardedBytes_);
+      }
+
+      LOGI_HELIX("rc: %d - available %d", rc, frame_buffer.available());
+    }
+
+    return result;
+  }
+
+  unsigned long helixDiagFrameOk_ = 0;
+  unsigned long helixDiagFrameBad_ = 0;
+  unsigned long helixDiagDiscardedBytes_ = 0;"""
+    if old in source:
+        common_path.write_text(source.replace(old, new, 1))
+
+
 def patch_foxen_psram_buffers():
     project_dir = Path(env.subst("$PROJECT_DIR"))
     decoder_path = (
@@ -284,4 +409,6 @@ patch_foxen_block_logging()
 patch_foxen_bit_depth_conversion()
 patch_foxen_native_output_info()
 patch_aac_sbr_diagnostic()
+patch_mp3_frame_diagnostic()
+patch_helix_resync_diagnostic()
 patch_foxen_psram_buffers()

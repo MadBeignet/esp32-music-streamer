@@ -79,10 +79,21 @@ public:
   // can't stall the UI thread indefinitely.
   static constexpr uint32_t MaxWriteWaitMs = 1000;
 
+  void cancelWrites() {
+    writesCancelled_.store(true, std::memory_order_release);
+  }
+
+  void resumeWrites() {
+    writesCancelled_.store(false, std::memory_order_release);
+  }
+
   size_t write(const uint8_t* data, size_t len) override {
     size_t offset = 0;
     const uint32_t waitStartMs = millis();
     while (offset < len) {
+      // Stop discards the remainder; reporting it consumed prevents
+      // decoder wrappers from retrying a cancelled write.
+      if (writesCancelled_.load(std::memory_order_acquire)) return len;
       const int written = pcmRing_.writeArray(
           data + offset, static_cast<int>(len - offset));
       if (written > 0) {
@@ -366,6 +377,7 @@ private:
   std::atomic<uint32_t> zeroFreeBreaks_{0};
   std::atomic<uint32_t> stalledCalls_{0};
   std::atomic<size_t> highWaterBytes_{0};
+  std::atomic<bool> writesCancelled_{true};
   // Deferred format-change state: written by setAudioInfo() on the decode
   // thread, consumed by applyPendingFormatChange() on the drain thread.
   portMUX_TYPE formatMux_ = portMUX_INITIALIZER_UNLOCKED;
@@ -402,8 +414,29 @@ public:
   explicit BitDepthUpconverter(audio_tools::AudioOutput& output)
       : output_(output) {}
 
+  void resetDiagnostics() {
+    inputBytes_.store(0, std::memory_order_relaxed);
+    outputBytes_.store(0, std::memory_order_relaxed);
+    formatNotifications_.store(0, std::memory_order_relaxed);
+    firstWrite_ = true;
+  }
+
+  void logDiagnostics() const {
+    Serial.printf(
+        "PCM track diagnostic: input_bytes=%lu output_bytes=%lu "
+        "format_notifications=%lu\n",
+        static_cast<unsigned long>(inputBytes_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(outputBytes_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(
+            formatNotifications_.load(std::memory_order_relaxed)));
+  }
+
   void setAudioInfo(audio_tools::AudioInfo info) override {
     widening_ = !kDiagnosticBypassWidening && info.bits_per_sample == 16;
+    formatNotifications_.fetch_add(1, std::memory_order_relaxed);
+    Serial.printf(
+        "PCM input format diagnostic: rate=%d channels=%d bits=%d widening=%d\n",
+        info.sample_rate, info.channels, info.bits_per_sample, widening_);
     audio_tools::AudioInfo outInfo = info;
     if (widening_) {
       outInfo.bits_per_sample = 32;
@@ -413,8 +446,21 @@ public:
   }
 
   size_t write(const uint8_t* data, size_t len) override {
+    if (len > 0 && firstWrite_) {
+      firstWrite_ = false;
+      const audio_tools::AudioInfo info = audioInfo();
+      Serial.printf(
+          "PCM first write diagnostic: rate=%d channels=%d bits=%d "
+          "widening=%d bytes=%u\n",
+          info.sample_rate, info.channels, info.bits_per_sample, widening_,
+          static_cast<unsigned>(len));
+    }
+    inputBytes_.fetch_add(static_cast<uint32_t>(len), std::memory_order_relaxed);
     if (!widening_) {
-      return output_.write(data, len);
+      const size_t written = output_.write(data, len);
+      outputBytes_.fetch_add(static_cast<uint32_t>(written),
+                            std::memory_order_relaxed);
+      return written;
     }
     // Decoders always hand us whole interleaved sample frames, never a
     // stray odd trailing byte, so len is always a multiple of sizeof(int16_t).
@@ -427,14 +473,16 @@ public:
         // same left-aligned convention Foxen's native FLAC output already
         // uses (see CodecFLACFoxen.h's patched bit-depth handling), so I2S
         // sees a consistent sample format regardless of source codec.
-        scratch_[i] = static_cast<int32_t>(src[i]) << 16;
+        scratch_[i] = static_cast<int32_t>(src[i]) * 65536;
       }
       // PcmRingOutput::write() (this class's eventual output_) always
       // either fully accepts a call or blocks/drops after MaxWriteWaitMs -
       // it never returns a short count to retry - so a single call per
       // batch is enough here too.
-      output_.write(reinterpret_cast<const uint8_t*>(scratch_),
-                    batch * sizeof(int32_t));
+      const size_t written = output_.write(
+          reinterpret_cast<const uint8_t*>(scratch_), batch * sizeof(int32_t));
+      outputBytes_.fetch_add(static_cast<uint32_t>(written),
+                            std::memory_order_relaxed);
       src += batch;
       samplesRemaining -= batch;
     }
@@ -456,6 +504,10 @@ private:
   audio_tools::AudioOutput& output_;
   int32_t scratch_[ScratchSamples];
   bool widening_ = false;
+  bool firstWrite_ = true;
+  std::atomic<uint32_t> inputBytes_{0};
+  std::atomic<uint32_t> outputBytes_{0};
+  std::atomic<uint32_t> formatNotifications_{0};
 };
 
 class AudioEngine {
@@ -478,6 +530,7 @@ private:
   // drives touch/UI on this same core - doesn't routinely block for however
   // long real-time playback needs to drain a large chunk.
   static constexpr size_t DecodeAheadMarginBytes = 256 * 1024;
+  static constexpr bool EnablePeriodicPerfLogging = false;
   SemaphoreHandle_t audioMutex = nullptr;
   I2SStream i2s;
   PcmRingOutput pcmOutput{i2s};
@@ -549,14 +602,10 @@ private:
   // it is safe for Core 1 to actually stop playback.
   std::atomic<bool> readSideEof_{false};
   std::atomic<bool> decodeSideEof_{false};
-  // decodeEnabled_ lets Core 0 skip decode work as soon as a track is
-  // stopping, without waiting on audioMutex (which Core 1's read step can
-  // hold for however long an SD read takes, ~100ms+). decodeInProgress_ is
-  // the actual correctness guard: stopUnlocked() waits for it to clear
-  // before touching decoderStream/audioFile, so a decode call already in
-  // flight on Core 0 always finishes cleanly first.
+  // Covers decode admission and completion so stop cannot free buffers
+  // while the worker is entering or executing a decode call.
   std::atomic<bool> decodeEnabled_{false};
-  std::atomic<bool> decodeInProgress_{false};
+  SemaphoreHandle_t decodeLifecycleMutex_ = nullptr;
   FsFile audioFile;
   String temporaryPath;
   // isPlaying/isPausedFlag are written on the decode thread (Core 1, via
@@ -1209,6 +1258,11 @@ public:
       Serial.println("Audio drain mutex allocation failed!");
       return;
     }
+    decodeLifecycleMutex_ = xSemaphoreCreateMutex();
+    if (decodeLifecycleMutex_ == nullptr) {
+      Serial.println("Audio decode lifecycle mutex allocation failed!");
+      return;
+    }
     for (int i = 0; i < PipelineDepth; ++i) {
       readBuffers_[i] = static_cast<uint8_t*>(ps_malloc(AudioCopyBufferSize));
       if (readBuffers_[i] == nullptr) {
@@ -1435,6 +1489,13 @@ public:
     // Reset it explicitly because automatic album continuation starts a new
     // file without reconstructing the decoder object.
     m4aContainer.getDemuxer().begin();
+    bitDepthUpconverter.resetDiagnostics();
+    // Decoder notifications deduplicate against a default 44.1kHz/16-bit
+    // format. Seed every PCM stage before decode so that default-format
+    // tracks cannot bypass widening, including after a native 32-bit FLAC.
+    audio_tools::AudioInfo inputInfo = initialInfo;
+    inputInfo.bits_per_sample = hasFlacExtension(filepath) ? 32 : 16;
+    volumeOut.setAudioInfo(inputInfo);
     decoderStream.setOutput(volumeOut);
     if (!decoderStream.begin()) {
       Serial.println("Failed to initialize FLAC decoder!");
@@ -1475,6 +1536,7 @@ public:
     // Enabling decode last, only once isPlaying/pipeline state above are
     // fully settled, means Core 0's decodeConsumeStep() never observes a
     // half-initialized track.
+    pcmOutput.resumeWrites();
     decodeEnabled_.store(true, std::memory_order_release);
   }
 
@@ -1538,7 +1600,9 @@ public:
   // Decode whichever buffer Core 1's read side most recently finished
   // filling, if any is ready within waitTicks.
   void decodeConsumeStep(TickType_t waitTicks = 0) {
+    xSemaphoreTake(decodeLifecycleMutex_, portMAX_DELAY);
     if (!decodeEnabled_.load(std::memory_order_acquire)) {
+      xSemaphoreGive(decodeLifecycleMutex_);
       return;
     }
     if (xSemaphoreTake(bufferReadySem_, waitTicks) != pdTRUE) {
@@ -1549,13 +1613,14 @@ public:
       if (readSideEof_.load(std::memory_order_acquire)) {
         decodeSideEof_.store(true, std::memory_order_release);
       }
+      xSemaphoreGive(decodeLifecycleMutex_);
       return;
     }
-    // Marks the window during which decoderStream/audioFile must not be
-    // torn down; stopUnlocked() (Core 1) waits for this to clear before
-    // touching either, so this call always finishes cleanly even if a
-    // stop/track-change is requested mid-decode.
-    decodeInProgress_.store(true, std::memory_order_relaxed);
+    if (!decodeEnabled_.load(std::memory_order_acquire)) {
+      xSemaphoreGive(bufferFreeSem_);
+      xSemaphoreGive(decodeLifecycleMutex_);
+      return;
+    }
     const int index = decodeIndex_;
     decodeIndex_ = 1 - decodeIndex_;
     const size_t len = readBufferLen_[index];
@@ -1572,7 +1637,7 @@ public:
                prevMax, decodeDurationUs, std::memory_order_relaxed)) {
     }
     xSemaphoreGive(bufferFreeSem_);
-    decodeInProgress_.store(false, std::memory_order_relaxed);
+    xSemaphoreGive(decodeLifecycleMutex_);
   }
 
   // Core 1 (main.cpp's loop(), called between touch/UI work): read one
@@ -1604,6 +1669,7 @@ public:
           "Audio stream reached EOF: elapsed_ms=%lu file_bytes=%lu\n",
           static_cast<unsigned long>(elapsedMs),
           static_cast<unsigned long>(audioFile ? audioFile.fileSize() : 0));
+      bitDepthUpconverter.logDiagnostics();
       trackFinished = true;
       stopUnlocked();
     }
@@ -1671,7 +1737,7 @@ public:
         readSideEof_.store(true, std::memory_order_release);
       }
     }
-    if (isPlaying) {
+    if (isPlaying && EnablePeriodicPerfLogging) {
       const uint32_t nowMs = millis();
       if (nowMs - perfWindowStartMs >= 1000) {
         Serial.printf(
@@ -1723,21 +1789,14 @@ public:
   void stopUnlocked() {
     isPlaying = false;
     isPausedFlag = false;
-    // Tell Core 0's decodeConsumeStep() to stop starting new decode calls,
-    // then wait for any call already in flight to finish - bounded, so a
-    // stuck/slow decode call can never hang the UI thread indefinitely
-    // (mirrors PcmRingOutput::MaxWriteWaitMs's philosophy). Only after this
-    // is it safe to call decoderStream.end()/close audioFile below, since
-    // decodeConsumeStep() reads both while running.
+    // Unblock writes waiting on a now-undrained ring before waiting for
+    // exclusive decoder ownership. Never free buffers after a timeout
+    // while decode still uses them.
     decodeEnabled_.store(false, std::memory_order_release);
-    {
-      const uint32_t waitStartMs = millis();
-      while (decodeInProgress_.load(std::memory_order_acquire)) {
-        if (millis() - waitStartMs > 250) {
-          break;
-        }
-        delay(1);
-      }
+    pcmOutput.cancelWrites();
+    const uint32_t stopStartMs = millis();
+    if (decodeLifecycleMutex_ != nullptr) {
+      xSemaphoreTake(decodeLifecycleMutex_, portMAX_DELAY);
     }
     // Discard any buffers Core 1 finished reading but Core 0 hadn't yet
     // decoded - fine to drop since playback is stopping/changing tracks
@@ -1772,6 +1831,11 @@ public:
       sd.remove(temporaryPath.c_str());
       temporaryPath = "";
     }
+    if (decodeLifecycleMutex_ != nullptr) {
+      xSemaphoreGive(decodeLifecycleMutex_);
+    }
+    Serial.printf("Audio stop complete: elapsed_ms=%lu\n",
+                  static_cast<unsigned long>(millis() - stopStartMs));
   }
 
   void stop() {
