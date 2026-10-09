@@ -111,6 +111,20 @@ The native tests do not require the ESP32 hardware. Local audio fixtures are
 used for some regression checks when available; they are not required for the
 firmware build.
 
+### Serial logs
+
+Run the PlatformIO serial monitor from the project root:
+
+```bash
+~/.platformio/penv/bin/pio device monitor -e seeed_xiao_esp32s3
+```
+
+The monitor uses 115200 baud, adds timestamps, and automatically saves output
+to `logs/device-monitor-YYMMDD-HHMMSS.log`. Local logs are excluded from Git.
+If automatic port selection fails, add `--port /dev/cu.usbmodem31101`, replacing
+the port with the current ESP32 device shown by `pio device list`.
+Close any other serial monitor before starting, and press Ctrl+C to stop.
+
 ## Project status
 
 The project is under active development. Known areas still being refined
